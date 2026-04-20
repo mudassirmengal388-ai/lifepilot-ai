@@ -1,39 +1,53 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest } from "next/server";
 
 export async function POST(req: NextRequest) {
   try {
     const { message, model = "groq", history = [] } = await req.json();
 
-    console.log("BODY:", { message, model });
-
     if (!message) {
-      return NextResponse.json({ error: "Message is required" }, { status: 400 });
+      return new Response(JSON.stringify({ error: "Message is required" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
-    if (model === "groq" || model === "deepseek" || model === "gemini") {
-  return await callGroq(message, history);
-} else {
-  return NextResponse.json({ error: "Invalid model" }, { status: 400 });
-}
-
+    return await streamGroq(message, history);
   } catch (err: any) {
     console.error("API Error:", err);
-    return NextResponse.json({ error: "Server error" }, { status: 500 });
+    return new Response(JSON.stringify({ error: "Server error" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 }
 
-// ✅ GROQ - Free & Fast
-async function callGroq(message: string, history: any[]) {
+async function streamGroq(message: string, history: any[]) {
   const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) return NextResponse.json({ error: "Groq API key missing" }, { status: 500 });
+
+  if (!apiKey) {
+    return new Response(JSON.stringify({ error: "Groq API key missing" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
 
   const messages = [
-    { role: "system", content: "You are LifePilot AI, a smart and helpful assistant." },
+    {
+      role: "system",
+      content: `You are LifePilot AI, an advanced personal assistant.
+Format your responses using markdown:
+- Use **bold** for important points
+- Use \`code\` for inline code
+- Use triple backtick blocks for multi-line code with language name
+- Use bullet points and numbered lists when helpful
+- Use ## headings for sections when needed
+Be concise, helpful, and professional.`,
+    },
     ...history,
     { role: "user", content: message },
   ];
 
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -42,54 +56,67 @@ async function callGroq(message: string, history: any[]) {
     body: JSON.stringify({
       model: "llama-3.3-70b-versatile",
       messages,
-      max_tokens: 1024,
+      max_tokens: 2048,
+      stream: true,
     }),
   });
 
-  const data = await res.json();
-  console.log("GROQ RESPONSE:", JSON.stringify(data, null, 2));
-
-  if (!res.ok) {
-    return NextResponse.json({ error: data.error?.message || "Groq failed" }, { status: 500 });
-  }
-
-  const reply = data.choices?.[0]?.message?.content || "No response";
-  return NextResponse.json({ reply, model: "groq" });
-}
-
-// ✅ GEMINI - Fixed Model
-async function callGemini(message: string, history: any[]) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return NextResponse.json({ error: "Gemini API key missing" }, { status: 500 });
-
-  const contents = [
-    ...history.map((m: any) => ({
-      role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content }],
-    })),
-    { role: "user", parts: [{ text: message }] },
-  ];
-
-  // ✅ gemini-2.0-flash - latest working model
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
-
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ contents }),
-  });
-
-  const data = await res.json();
-  console.log("GEMINI RESPONSE:", JSON.stringify(data, null, 2));
-
-  if (!res.ok || data.error) {
-    return NextResponse.json(
-      { error: data.error?.message || "Gemini failed" },
-      { status: 500 }
+  if (!groqRes.ok || !groqRes.body) {
+    const err = await groqRes.json().catch(() => ({}));
+    return new Response(
+      JSON.stringify({ error: err?.error?.message || "Groq request failed" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
     );
   }
 
-  const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || "No response";
-  return NextResponse.json({ reply, model: "gemini" });
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const reader = groqRes.body!.getReader();
+      const decoder = new TextDecoder();
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split("\n");
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || !trimmed.startsWith("data: ")) continue;
+
+            const data = trimmed.slice(6);
+            if (data === "[DONE]") {
+              controller.close();
+              return;
+            }
+
+            try {
+              const parsed = JSON.parse(data);
+              const token = parsed.choices?.[0]?.delta?.content;
+              if (token) {
+                controller.enqueue(encoder.encode(token));
+              }
+            } catch {
+              // skip malformed JSON chunks
+            }
+          }
+        }
+      } catch (e) {
+        controller.error(e);
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
 }
