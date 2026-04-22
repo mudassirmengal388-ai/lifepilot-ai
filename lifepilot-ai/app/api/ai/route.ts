@@ -1,122 +1,536 @@
-import { NextRequest } from "next/server";
+"use client";
 
-export async function POST(req: NextRequest) {
-  try {
-    const { message, model = "groq", history = [] } = await req.json();
+import { useState, useRef, useEffect, useCallback } from "react";
+import { createClient } from "@/lib/supabase";
 
-    if (!message) {
-      return new Response(JSON.stringify({ error: "Message is required" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+type Message = { role: "user" | "ai"; content: string };
+type Model = "groq" | "gemini";
+type Conversation = { id: string; title: string; created_at: string };
+type Language = "auto" | "en" | "ur" | "hi" | "ar";
 
-    return await streamGroq(message, history);
-  } catch (err: any) {
-    console.error("API Error:", err);
-    return new Response(JSON.stringify({ error: "Server error" }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+const LANGUAGES: { code: Language; label: string; flag: string; placeholder: string }[] = [
+  { code: "auto", label: "Auto", flag: "🌐", placeholder: "Message LifePilot AI... (any language)" },
+  { code: "en", label: "English", flag: "🇬🇧", placeholder: "Message LifePilot AI..." },
+  { code: "ur", label: "اردو", flag: "🇵🇰", placeholder: "...یہاں لکھیں" },
+  { code: "hi", label: "हिंदी", flag: "🇮🇳", placeholder: "यहाँ लिखें..." },
+  { code: "ar", label: "العربية", flag: "🇸🇦", placeholder: "...اكتب هنا" },
+];
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
-async function streamGroq(message: string, history: any[]) {
-  const apiKey = process.env.GROQ_API_KEY;
+function renderMarkdown(text: string): string {
+  let html = text;
+  html = html.replace(
+    /```(\w+)?\n?([\s\S]*?)```/g,
+    (_: string, lang: string, code: string) =>
+      `<pre class="code-block"><div class="code-lang">${lang || "code"}</div><code>${escapeHtml(code.trim())}</code></pre>`
+  );
+  html = html.replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>');
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
+  html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
+  html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
+  html = html.replace(/^[-*] (.+)$/gm, "<li>$1</li>");
+  html = html.replace(/^\d+\. (.+)$/gm, "<li>$1</li>");
+  html = html.replace(/\n\n/g, "<br/><br/>");
+  html = html.replace(/\n/g, "<br/>");
+  return html;
+}
 
-  if (!apiKey) {
-    return new Response(JSON.stringify({ error: "Groq API key missing" }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+export default function ChatPage() {
+  const [input, setInput] = useState("");
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [model, setModel] = useState<Model>("groq");
+  const [error, setError] = useState<string | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [currentConvId, setCurrentConvId] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
+  const [streamingText, setStreamingText] = useState("");
+  const [copied, setCopied] = useState<number | null>(null);
+  const [userEmail, setUserEmail] = useState("");
+  const [selectedLang, setSelectedLang] = useState<Language>("auto");
+  const [isListening, setIsListening] = useState(false);
+  const [voiceSupported, setVoiceSupported] = useState(false);
+  const [langMenuOpen, setLangMenuOpen] = useState(false);
 
-  const messages = [
-    {
-      role: "system",
-      content: `You are LifePilot AI, an advanced personal assistant.
-Format your responses using markdown:
-- Use **bold** for important points
-- Use \`code\` for inline code
-- Use triple backtick blocks for multi-line code with language name
-- Use bullet points and numbered lists when helpful
-- Use ## headings for sections when needed
-Be concise, helpful, and professional.`,
-    },
-    ...history,
-    { role: "user", content: message },
-  ];
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const supabase = createClient();
 
-  const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
-      messages,
-      max_tokens: 2048,
-      stream: true,
-    }),
-  });
+  // Check voice support
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const SpeechRecognition =
+        window.SpeechRecognition || (window as typeof window & { webkitSpeechRecognition?: typeof window.SpeechRecognition }).webkitSpeechRecognition;
+      setVoiceSupported(!!SpeechRecognition);
+    }
+  }, []);
 
-  if (!groqRes.ok || !groqRes.body) {
-    const err = await groqRes.json().catch(() => ({}));
-    return new Response(
-      JSON.stringify({ error: err?.error?.message || "Groq request failed" }),
-      { status: 500, headers: { "Content-Type": "application/json" } }
-    );
-  }
+  // Auth check
+  useEffect(() => {
+    const init = async () => {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) { window.location.href = "/auth"; return; }
+      setUserId(user.id);
+      setUserEmail(user.email || "");
+      loadConversations(user.id);
+    };
+    init();
+  }, []);
 
-  const encoder = new TextEncoder();
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, streamingText]);
 
-  const stream = new ReadableStream({
-    async start(controller) {
-      const reader = groqRes.body!.getReader();
-      const decoder = new TextDecoder();
+  // Close lang menu on outside click
+  useEffect(() => {
+    const close = () => setLangMenuOpen(false);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, []);
 
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+  const loadConversations = async (uid: string) => {
+    const { data } = await supabase
+      .from("conversations")
+      .select("*")
+      .eq("user_id", uid)
+      .order("created_at", { ascending: false });
+    if (data) setConversations(data);
+  };
 
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split("\n");
+  const loadMessages = async (convId: string) => {
+    const { data } = await supabase
+      .from("messages")
+      .select("*")
+      .eq("conversation_id", convId)
+      .order("created_at", { ascending: true });
+    if (data)
+      setMessages(data.map((m) => ({ role: m.role, content: m.content })));
+  };
 
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || !trimmed.startsWith("data: ")) continue;
+  const selectConversation = (conv: Conversation) => {
+    setCurrentConvId(conv.id);
+    loadMessages(conv.id);
+    setError(null);
+    setStreamingText("");
+  };
 
-            const data = trimmed.slice(6);
-            if (data === "[DONE]") {
-              controller.close();
-              return;
-            }
+  const newChat = () => {
+    setCurrentConvId(null);
+    setMessages([]);
+    setError(null);
+    setInput("");
+    setStreamingText("");
+  };
 
-            try {
-              const parsed = JSON.parse(data);
-              const token = parsed.choices?.[0]?.delta?.content;
-              if (token) {
-                controller.enqueue(encoder.encode(token));
-              }
-            } catch {
-              // skip malformed JSON chunks
-            }
-          }
-        }
-      } catch (e) {
-        controller.error(e);
-      } finally {
-        controller.close();
+  // Voice Input
+  const startVoiceInput = useCallback(() => {
+    if (!voiceSupported) return;
+
+    const SpeechRecognition =
+      window.SpeechRecognition ||
+      (window as typeof window & { webkitSpeechRecognition?: typeof window.SpeechRecognition }).webkitSpeechRecognition;
+
+    if (!SpeechRecognition) return;
+
+    if (isListening) {
+      recognitionRef.current?.stop();
+      setIsListening(false);
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognitionRef.current = recognition;
+
+    // Set language based on selection
+    const langMap: Record<Language, string> = {
+      auto: "en-US",
+      en: "en-US",
+      ur: "ur-PK",
+      hi: "hi-IN",
+      ar: "ar-SA",
+    };
+    recognition.lang = langMap[selectedLang];
+    recognition.continuous = false;
+    recognition.interimResults = true;
+
+    recognition.onstart = () => setIsListening(true);
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      const transcript = Array.from(event.results)
+        .map((r) => r[0].transcript)
+        .join("");
+      setInput(transcript);
+      if (textareaRef.current) {
+        textareaRef.current.style.height = "44px";
+        textareaRef.current.style.height =
+          Math.min(textareaRef.current.scrollHeight, 200) + "px";
       }
-    },
-  });
+    };
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/plain; charset=utf-8",
-      "X-Content-Type-Options": "nosniff",
-    },
-  });
+    recognition.onend = () => setIsListening(false);
+    recognition.onerror = () => setIsListening(false);
+
+    recognition.start();
+  }, [voiceSupported, isListening, selectedLang]);
+
+  const sendMessage = async () => {
+    if (!input.trim() || loading || !userId) return;
+
+    const userInput = input.trim();
+    const userMsg: Message = { role: "user", content: userInput };
+    const newMessages = [...messages, userMsg];
+
+    setMessages(newMessages);
+    setInput("");
+    setLoading(true);
+    setError(null);
+    setStreamingText("");
+
+    if (textareaRef.current) textareaRef.current.style.height = "44px";
+
+    try {
+      let convId = currentConvId;
+      if (!convId) {
+        const { data: conv } = await supabase
+          .from("conversations")
+          .insert({ user_id: userId, title: userInput.slice(0, 45) })
+          .select()
+          .single();
+        if (conv) {
+          convId = conv.id;
+          setCurrentConvId(conv.id);
+          setConversations((prev) => [conv, ...prev]);
+        }
+      }
+
+      if (convId) {
+        await supabase.from("messages").insert({
+          conversation_id: convId,
+          role: "user",
+          content: userInput,
+        });
+      }
+
+      const history = newMessages.slice(-10).map((m) => ({
+        role: m.role === "user" ? "user" : "assistant",
+        content: m.content,
+      }));
+
+      const res = await fetch("/api/ai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: userInput, model, history }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({ error: "Request failed" }));
+        throw new Error(errData.error || "Request failed");
+      }
+
+      if (!res.body) throw new Error("No response body");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let fullReply = "";
+
+      setLoading(false);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        fullReply += chunk;
+        setStreamingText(fullReply);
+      }
+
+      setMessages([...newMessages, { role: "ai", content: fullReply }]);
+      setStreamingText("");
+
+      if (convId) {
+        await supabase.from("messages").insert({
+          conversation_id: convId,
+          role: "ai",
+          content: fullReply,
+        });
+      }
+    } catch (err: unknown) {
+      setLoading(false);
+      setStreamingText("");
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+    }
+  };
+
+  const deleteConversation = async (e: React.MouseEvent, convId: string) => {
+    e.stopPropagation();
+    await supabase.from("conversations").delete().eq("id", convId);
+    setConversations((prev) => prev.filter((c) => c.id !== convId));
+    if (currentConvId === convId) newChat();
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  };
+
+  const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setInput(e.target.value);
+    e.target.style.height = "44px";
+    e.target.style.height = Math.min(e.target.scrollHeight, 200) + "px";
+  };
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    window.location.href = "/auth";
+  };
+
+  const copyMessage = (text: string, index: number) => {
+    navigator.clipboard.writeText(text);
+    setCopied(index);
+    setTimeout(() => setCopied(null), 2000);
+  };
+
+  const currentLang = LANGUAGES.find((l) => l.code === selectedLang)!;
+  const avatarLetter = userEmail ? userEmail[0].toUpperCase() : "U";
+  const isRTL = selectedLang === "ur" || selectedLang === "ar";
+
+  return (
+    <div className="app">
+      <div className="bg-orbs">
+        <div className="orb orb-1" />
+        <div className="orb orb-2" />
+        <div className="orb orb-3" />
+      </div>
+
+      {/* SIDEBAR */}
+      <aside className={`sidebar ${sidebarOpen ? "open" : "closed"}`}>
+        <div className="sidebar-header">
+          <div className="logo-wrap">
+            <span className="logo-icon">⚡</span>
+            <span className="logo-text">LifePilot</span>
+          </div>
+          <button className="icon-btn" onClick={() => setSidebarOpen(false)}>✕</button>
+        </div>
+
+        <button className="new-chat-btn" onClick={newChat}>
+          <span>+</span> New Chat
+        </button>
+
+        <div className="chat-list">
+          <div className="chat-list-label">Recent Chats</div>
+          {conversations.length === 0 && (
+            <div className="chat-empty">No conversations yet</div>
+          )}
+          {conversations.map((conv) => (
+            <div
+              key={conv.id}
+              className={`chat-item ${currentConvId === conv.id ? "active" : ""}`}
+              onClick={() => selectConversation(conv)}
+            >
+              <span className="chat-item-icon">💬</span>
+              <span className="chat-item-title">{conv.title || "New Chat"}</span>
+              <button className="delete-btn" onClick={(e) => deleteConversation(e, conv.id)}>✕</button>
+            </div>
+          ))}
+        </div>
+
+        <div className="sidebar-footer">
+          <div className="model-section">
+            <div className="model-label">AI Model</div>
+            <div className="model-pills">
+              <button className={`pill ${model === "groq" ? "active" : ""}`} onClick={() => setModel("groq")}>
+                🦙 LLaMA 3.3
+              </button>
+              <button className={`pill ${model === "gemini" ? "active" : ""}`} onClick={() => setModel("gemini")}>
+                ✨ Gemini
+              </button>
+            </div>
+          </div>
+          <div className="user-row">
+            <div className="user-avatar">{avatarLetter}</div>
+            <div className="user-info">
+              <span className="user-email">{userEmail || "User"}</span>
+              <span className="user-plan">Free Plan</span>
+            </div>
+            <button className="logout-icon-btn" onClick={handleLogout} title="Logout">↪</button>
+          </div>
+        </div>
+      </aside>
+
+      {/* MAIN */}
+      <main className="main">
+        <div className="topbar">
+          {!sidebarOpen && (
+            <button className="icon-btn menu-btn" onClick={() => setSidebarOpen(true)}>☰</button>
+          )}
+          <div className="topbar-center">
+            <span className="topbar-logo">⚡</span>
+            <span className="topbar-title">LifePilot AI</span>
+          </div>
+          <div className="topbar-right">
+            {/* Language Selector */}
+            <div className="lang-selector" onClick={(e) => { e.stopPropagation(); setLangMenuOpen(!langMenuOpen); }}>
+              <span>{currentLang.flag}</span>
+              <span className="lang-label">{currentLang.label}</span>
+              <span className="lang-arrow">▾</span>
+              {langMenuOpen && (
+                <div className="lang-menu">
+                  {LANGUAGES.map((lang) => (
+                    <button
+                      key={lang.code}
+                      className={`lang-option ${selectedLang === lang.code ? "active" : ""}`}
+                      onClick={(e) => { e.stopPropagation(); setSelectedLang(lang.code); setLangMenuOpen(false); }}
+                    >
+                      <span>{lang.flag}</span>
+                      <span>{lang.label}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <span className="model-badge">
+              {model === "groq" ? "🦙 LLaMA 3.3" : "✨ Gemini"}
+            </span>
+            <div className="status-dot" />
+          </div>
+        </div>
+
+        {/* MESSAGES */}
+        <div className="messages">
+          {messages.length === 0 && !streamingText && (
+            <div className="welcome">
+              <div className="welcome-glow" />
+              <div className="welcome-icon">⚡</div>
+              <h2 className="welcome-title">LifePilot AI</h2>
+              <p className="welcome-sub">Your intelligent multilingual assistant</p>
+              <div className="welcome-features">
+                <span className="feature-tag">🧠 Deep Thinking</span>
+                <span className="feature-tag">🌐 4 Languages</span>
+                <span className="feature-tag">🎤 Voice Input</span>
+                <span className="feature-tag">💻 Code Expert</span>
+              </div>
+              <div className="suggestions">
+                {[
+                  "آپ مجھے کاروبار کا آئیڈیا دیں",
+                  "Explain quantum computing simply",
+                  "मुझे Python सिखाओ",
+                ].map((s) => (
+                  <button
+                    key={s}
+                    className="suggestion-btn"
+                    onClick={() => { setInput(s); textareaRef.current?.focus(); }}
+                  >{s}</button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {messages.map((msg, i) => (
+            <div key={i} className={`msg ${msg.role}`}>
+              <div className="msg-avatar">
+                {msg.role === "user" ? avatarLetter : "⚡"}
+              </div>
+              <div className="msg-content">
+                {msg.role === "ai" ? (
+                  <>
+                    <div
+                      className="msg-text markdown"
+                      dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
+                    />
+                    <button className="copy-btn" onClick={() => copyMessage(msg.content, i)}>
+                      {copied === i ? "✅ Copied!" : "⎘ Copy"}
+                    </button>
+                  </>
+                ) : (
+                  <div className={`msg-text user-text ${isRTL ? "rtl" : ""}`}>
+                    {msg.content}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+
+          {streamingText && (
+            <div className="msg ai">
+              <div className="msg-avatar">⚡</div>
+              <div className="msg-content">
+                <div
+                  className="msg-text markdown streaming"
+                  dangerouslySetInnerHTML={{ __html: renderMarkdown(streamingText) }}
+                />
+              </div>
+            </div>
+          )}
+
+          {loading && !streamingText && (
+            <div className="msg ai">
+              <div className="msg-avatar">⚡</div>
+              <div className="msg-content">
+                <div className="typing"><span /><span /><span /></div>
+              </div>
+            </div>
+          )}
+
+          {error && <div className="error-msg">⚠️ {error}</div>}
+          <div ref={bottomRef} />
+        </div>
+
+        {/* INPUT */}
+        <div className="input-wrapper">
+          {isListening && (
+            <div className="voice-indicator">
+              <span className="voice-dot" />
+              <span>Listening... speak now</span>
+              <span className="voice-waves">
+                <span /><span /><span /><span /><span />
+              </span>
+            </div>
+          )}
+          <div className={`input-box ${isRTL ? "rtl-input" : ""}`}>
+            {voiceSupported && (
+              <button
+                className={`voice-btn ${isListening ? "listening" : ""}`}
+                onClick={startVoiceInput}
+                title={isListening ? "Stop listening" : "Voice input"}
+              >
+                {isListening ? "⏹" : "🎤"}
+              </button>
+            )}
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={handleInput}
+              onKeyDown={handleKeyDown}
+              placeholder={currentLang.placeholder}
+              disabled={loading}
+              rows={1}
+              dir={isRTL ? "rtl" : "ltr"}
+            />
+            <button
+              className="send-btn"
+              onClick={sendMessage}
+              disabled={loading || !input.trim()}
+            >
+              {loading ? <span className="send-spinner" /> : "↑"}
+            </button>
+          </div>
+          <p className="input-hint">
+            {currentLang.flag} {currentLang.label} • Enter = send • Shift+Enter = new line
+            {voiceSupported ? " • 🎤 Voice supported" : ""}
+          </p>
+        </div>
+      </main>
+    </div>
+  );
 }

@@ -16,38 +16,21 @@ function escapeHtml(str: string): string {
 
 function renderMarkdown(text: string): string {
   let html = text;
-
-  // Code blocks first
   html = html.replace(
     /```(\w+)?\n?([\s\S]*?)```/g,
-    (_match: string, lang: string, code: string) =>
+    (_: string, lang: string, code: string) =>
       `<pre class="code-block"><div class="code-lang">${lang || "code"}</div><code>${escapeHtml(code.trim())}</code></pre>`
   );
-
-  // Inline code
   html = html.replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>');
-
-  // Bold
   html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-
-  // Italic
   html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
-
-  // Headings
   html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
   html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
   html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
-
-  // Bullet lists
   html = html.replace(/^[-*] (.+)$/gm, "<li>$1</li>");
-
-  // Numbered lists
   html = html.replace(/^\d+\. (.+)$/gm, "<li>$1</li>");
-
-  // Paragraphs
   html = html.replace(/\n\n/g, "<br/><br/>");
   html = html.replace(/\n/g, "<br/>");
-
   return html;
 }
 
@@ -63,33 +46,27 @@ export default function ChatPage() {
   const [userId, setUserId] = useState<string | null>(null);
   const [streamingText, setStreamingText] = useState("");
   const [copied, setCopied] = useState<number | null>(null);
+  const [userEmail, setUserEmail] = useState("");
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const supabase = createClient();
 
-  // ── Auth check + load conversations ──
   useEffect(() => {
     const init = async () => {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-      if (!user) {
-        window.location.href = "/auth";
-        return;
-      }
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) { window.location.href = "/auth"; return; }
       setUserId(user.id);
+      setUserEmail(user.email || "");
       loadConversations(user.id);
     };
     init();
   }, []);
 
-  // ── Auto scroll ──
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streamingText]);
 
-  // ── Load conversations ──
   const loadConversations = async (uid: string) => {
     const { data } = await supabase
       .from("conversations")
@@ -99,15 +76,13 @@ export default function ChatPage() {
     if (data) setConversations(data);
   };
 
-  // ── Load messages for a conversation ──
   const loadMessages = async (convId: string) => {
     const { data } = await supabase
       .from("messages")
       .select("*")
       .eq("conversation_id", convId)
       .order("created_at", { ascending: true });
-    if (data)
-      setMessages(data.map((m) => ({ role: m.role, content: m.content })));
+    if (data) setMessages(data.map((m) => ({ role: m.role, content: m.content })));
   };
 
   const selectConversation = (conv: Conversation) => {
@@ -125,7 +100,6 @@ export default function ChatPage() {
     setStreamingText("");
   };
 
-  // ── Send message with streaming ──
   const sendMessage = async () => {
     if (!input.trim() || loading || !userId) return;
 
@@ -142,7 +116,6 @@ export default function ChatPage() {
     if (textareaRef.current) textareaRef.current.style.height = "44px";
 
     try {
-      // Create new conversation if needed
       let convId = currentConvId;
       if (!convId) {
         const { data: conv } = await supabase
@@ -157,7 +130,6 @@ export default function ChatPage() {
         }
       }
 
-      // Save user message to DB
       if (convId) {
         await supabase.from("messages").insert({
           conversation_id: convId,
@@ -166,13 +138,11 @@ export default function ChatPage() {
         });
       }
 
-      // Build history
       const history = newMessages.slice(-10).map((m) => ({
         role: m.role === "user" ? "user" : "assistant",
         content: m.content,
       }));
 
-      // Call API
       const res = await fetch("/api/ai", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -180,17 +150,14 @@ export default function ChatPage() {
       });
 
       if (!res.ok) {
-        const errData = await res
-          .json()
-          .catch(() => ({ error: "Request failed" }));
+        const errData = await res.json().catch(() => ({ error: "Request failed" }));
         throw new Error(errData.error || "Request failed");
       }
 
       if (!res.body) throw new Error("No response body");
 
-      // Read stream
       const reader = res.body.getReader();
-      const decoder = new TextDecoder();
+      const decoder = new TextDecoder("utf-8");
       let fullReply = "";
 
       setLoading(false);
@@ -203,11 +170,9 @@ export default function ChatPage() {
         setStreamingText(fullReply);
       }
 
-      // Finalize
       setMessages([...newMessages, { role: "ai", content: fullReply }]);
       setStreamingText("");
 
-      // Save AI reply to DB
       if (convId) {
         await supabase.from("messages").insert({
           conversation_id: convId,
@@ -218,18 +183,11 @@ export default function ChatPage() {
     } catch (err: unknown) {
       setLoading(false);
       setStreamingText("");
-      if (err instanceof Error) {
-        setError(err.message || "Something went wrong. Please try again.");
-      } else {
-        setError("Something went wrong. Please try again.");
-      }
+      setError(err instanceof Error ? err.message : "Something went wrong.");
     }
   };
 
-  const deleteConversation = async (
-    e: React.MouseEvent,
-    convId: string
-  ) => {
+  const deleteConversation = async (e: React.MouseEvent, convId: string) => {
     e.stopPropagation();
     await supabase.from("conversations").delete().eq("id", convId);
     setConversations((prev) => prev.filter((c) => c.id !== convId));
@@ -237,10 +195,7 @@ export default function ChatPage() {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   };
 
   const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -260,66 +215,69 @@ export default function ChatPage() {
     setTimeout(() => setCopied(null), 2000);
   };
 
+  const avatarLetter = userEmail ? userEmail[0].toUpperCase() : "U";
+
   return (
     <div className="app">
+      {/* Animated background */}
+      <div className="bg-orbs">
+        <div className="orb orb-1" />
+        <div className="orb orb-2" />
+        <div className="orb orb-3" />
+      </div>
+
       {/* ── SIDEBAR ── */}
       <aside className={`sidebar ${sidebarOpen ? "open" : "closed"}`}>
         <div className="sidebar-header">
-          <span className="logo">⚡ LifePilot</span>
-          <button className="icon-btn" onClick={() => setSidebarOpen(false)}>
-            ✕
-          </button>
+          <div className="logo-wrap">
+            <span className="logo-icon">⚡</span>
+            <span className="logo-text">LifePilot</span>
+          </div>
+          <button className="icon-btn" onClick={() => setSidebarOpen(false)}>✕</button>
         </div>
 
         <button className="new-chat-btn" onClick={newChat}>
-          + New Chat
+          <span>+</span> New Chat
         </button>
 
         <div className="chat-list">
-          <div className="chat-list-label">Conversations</div>
+          <div className="chat-list-label">Recent Chats</div>
           {conversations.length === 0 && (
             <div className="chat-empty">No conversations yet</div>
           )}
           {conversations.map((conv) => (
             <div
               key={conv.id}
-              className={`chat-item ${
-                currentConvId === conv.id ? "active" : ""
-              }`}
+              className={`chat-item ${currentConvId === conv.id ? "active" : ""}`}
               onClick={() => selectConversation(conv)}
             >
-              <span className="chat-item-title">
-                {conv.title || "New Chat"}
-              </span>
-              <button
-                className="delete-btn"
-                onClick={(e) => deleteConversation(e, conv.id)}
-              >
-                ✕
-              </button>
+              <span className="chat-item-icon">💬</span>
+              <span className="chat-item-title">{conv.title || "New Chat"}</span>
+              <button className="delete-btn" onClick={(e) => deleteConversation(e, conv.id)}>✕</button>
             </div>
           ))}
         </div>
 
         <div className="sidebar-footer">
-          <div className="model-label">Model</div>
-          <div className="model-pills">
-            <button
-              className={`pill ${model === "groq" ? "active" : ""}`}
-              onClick={() => setModel("groq")}
-            >
-              🦙 LLaMA
-            </button>
-            <button
-              className={`pill ${model === "gemini" ? "active" : ""}`}
-              onClick={() => setModel("gemini")}
-            >
-              ✨ Gemini
-            </button>
+          <div className="model-section">
+            <div className="model-label">AI Model</div>
+            <div className="model-pills">
+              <button className={`pill ${model === "groq" ? "active" : ""}`} onClick={() => setModel("groq")}>
+                🦙 LLaMA 3.3
+              </button>
+              <button className={`pill ${model === "gemini" ? "active" : ""}`} onClick={() => setModel("gemini")}>
+                ✨ Gemini
+              </button>
+            </div>
           </div>
-          <button className="logout-btn" onClick={handleLogout}>
-            Logout
-          </button>
+          <div className="user-row">
+            <div className="user-avatar">{avatarLetter}</div>
+            <div className="user-info">
+              <span className="user-email">{userEmail || "User"}</span>
+              <span className="user-plan">Free Plan</span>
+            </div>
+            <button className="logout-icon-btn" onClick={handleLogout} title="Logout">↪</button>
+          </div>
         </div>
       </aside>
 
@@ -327,40 +285,41 @@ export default function ChatPage() {
       <main className="main">
         <div className="topbar">
           {!sidebarOpen && (
-            <button
-              className="icon-btn"
-              onClick={() => setSidebarOpen(true)}
-            >
-              ☰
-            </button>
+            <button className="icon-btn menu-btn" onClick={() => setSidebarOpen(true)}>☰</button>
           )}
-          <span className="topbar-title">LifePilot AI</span>
-          <span className="model-badge">
-            {model === "groq" ? "🦙 LLaMA 3.3" : "✨ Gemini"}
-          </span>
+          <div className="topbar-center">
+            <span className="topbar-logo">⚡</span>
+            <span className="topbar-title">LifePilot AI</span>
+          </div>
+          <div className="topbar-right">
+            <span className="model-badge">
+              {model === "groq" ? "🦙 LLaMA 3.3" : "✨ Gemini"}
+            </span>
+            <div className="status-dot" />
+          </div>
         </div>
 
         {/* ── MESSAGES ── */}
         <div className="messages">
           {messages.length === 0 && !streamingText && (
             <div className="welcome">
+              <div className="welcome-glow" />
               <div className="welcome-icon">⚡</div>
-              <h2>LifePilot AI</h2>
-              <p>Your personal AI assistant — ask me anything</p>
+              <h2 className="welcome-title">LifePilot AI</h2>
+              <p className="welcome-sub">Your intelligent multilingual assistant</p>
+              <div className="welcome-features">
+                <span className="feature-tag">🧠 Deep Thinking</span>
+                <span className="feature-tag">🌐 Urdu + English</span>
+                <span className="feature-tag">💻 Code Expert</span>
+              </div>
               <div className="suggestions">
                 {[
-                  "Give me a profitable business idea",
-                  "Explain async/await in JavaScript",
-                  "Write a professional email template",
+                  "آپ مجھے کاروبار کا آئیڈیا دیں",
+                  "Explain quantum computing simply",
+                  "Write a Python web scraper",
                 ].map((s) => (
-                  <button
-                    key={s}
-                    className="suggestion-btn"
-                    onClick={() => {
-                      setInput(s);
-                      textareaRef.current?.focus();
-                    }}
-                  >
+                  <button key={s} className="suggestion-btn"
+                    onClick={() => { setInput(s); textareaRef.current?.focus(); }}>
                     {s}
                   </button>
                 ))}
@@ -371,55 +330,44 @@ export default function ChatPage() {
           {messages.map((msg, i) => (
             <div key={i} className={`msg ${msg.role}`}>
               <div className="msg-avatar">
-                {msg.role === "user" ? "U" : "⚡"}
+                {msg.role === "user" ? avatarLetter : "⚡"}
               </div>
               <div className="msg-content">
                 {msg.role === "ai" ? (
                   <>
                     <div
                       className="msg-text markdown"
-                      dangerouslySetInnerHTML={{
-                        __html: renderMarkdown(msg.content),
-                      }}
+                      dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
                     />
-                    <button
-                      className="copy-btn"
-                      onClick={() => copyMessage(msg.content, i)}
-                    >
-                      {copied === i ? "✅ Copied!" : "Copy"}
+                    <button className="copy-btn" onClick={() => copyMessage(msg.content, i)}>
+                      {copied === i ? "✅ Copied!" : "⎘ Copy"}
                     </button>
                   </>
                 ) : (
-                  <div className="msg-text">{msg.content}</div>
+                  <div className="msg-text user-text">{msg.content}</div>
                 )}
               </div>
             </div>
           ))}
 
-          {/* Streaming bubble */}
           {streamingText && (
             <div className="msg ai">
               <div className="msg-avatar">⚡</div>
               <div className="msg-content">
                 <div
                   className="msg-text markdown streaming"
-                  dangerouslySetInnerHTML={{
-                    __html: renderMarkdown(streamingText),
-                  }}
+                  dangerouslySetInnerHTML={{ __html: renderMarkdown(streamingText) }}
                 />
               </div>
             </div>
           )}
 
-          {/* Loading dots */}
           {loading && !streamingText && (
             <div className="msg ai">
               <div className="msg-avatar">⚡</div>
               <div className="msg-content">
                 <div className="typing">
-                  <span></span>
-                  <span></span>
-                  <span></span>
+                  <span /><span /><span />
                 </div>
               </div>
             </div>
@@ -437,19 +385,15 @@ export default function ChatPage() {
               value={input}
               onChange={handleInput}
               onKeyDown={handleKeyDown}
-              placeholder="Message LifePilot AI..."
+              placeholder="Message LifePilot AI... (English / اردو)"
               disabled={loading}
               rows={1}
             />
-            <button
-              className="send-btn"
-              onClick={sendMessage}
-              disabled={loading || !input.trim()}
-            >
-              ↑
+            <button className="send-btn" onClick={sendMessage} disabled={loading || !input.trim()}>
+              {loading ? <span className="send-spinner" /> : "↑"}
             </button>
           </div>
-          <p className="input-hint">Enter = send • Shift+Enter = new line</p>
+          <p className="input-hint">Enter = send • Shift+Enter = new line • Urdu supported ✓</p>
         </div>
       </main>
     </div>
